@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Java Editor</title>
+<style>
+  :root { --bg:#1b1d23; --panel:#14161b; --line:#2c2f38; --fg:#d8dae0; --dim:#8a8f9c; --accent:#f0a030; --err:#ff7b72; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body { display:flex; flex-direction:column; background:var(--bg); color:var(--fg);
+         font:14px/1.5 "Hiragino Sans","Yu Gothic UI","Noto Sans JP",system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:15px; font-weight:600; margin:0 auto 0 0; }
+  #status { color:var(--dim); font-size:13px; }
+  button { font:inherit; color:#1b1d23; background:var(--accent); border:0; border-radius:4px; padding:6px 16px; font-weight:600; cursor:pointer; }
+  button.sub { background:transparent; color:var(--fg); border:1px solid var(--line); font-weight:400; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button:focus-visible { outline:2px solid #fff; outline-offset:2px; }
+  main { flex:1; display:flex; flex-direction:column; min-height:0; }
+  #editor { flex:1; min-height:0; }
+  #bottom { height:34%; min-height:140px; display:flex; border-top:1px solid var(--line); background:var(--panel); }
+  #bottom section { display:flex; flex-direction:column; min-width:0; }
+  #in-wrap { flex:0 0 30%; border-right:1px solid var(--line); }
+  #out-wrap { flex:1; }
+  .head { padding:4px 12px; color:var(--dim); font-size:12px; border-bottom:1px solid var(--line); }
+  #stdin { flex:1; resize:none; border:0; outline:0; padding:8px 12px; color:var(--fg); background:transparent;
+           font:13px/1.5 ui-monospace,Menlo,Consolas,monospace; }
+  #stdin:focus-visible { box-shadow:inset 0 0 0 2px var(--accent); }
+  #console { flex:1; margin:0; padding:8px 12px; overflow:auto; white-space:pre-wrap;
+             font:13px/1.5 ui-monospace,Menlo,Consolas,monospace; }
+  .msg-err { color:var(--err); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Java Editor</h1>
+  <span id="status">エディターを読み込み中…</span>
+  <button class="sub" id="reset" type="button">サンプルに戻す</button>
+  <button id="run" type="button" disabled>実行 (Ctrl+Enter)</button>
+</header>
+<main>
+  <div id="editor"></div>
+  <div id="bottom">
+    <section id="in-wrap">
+      <div class="head">標準入力（Scanner 用。実行前に1行ずつ入力）</div>
+      <textarea id="stdin" spellcheck="false" placeholder="例:&#10;10&#10;20"></textarea>
+    </section>
+    <section id="out-wrap">
+      <div class="head">出力</div>
+      <pre id="console"></pre>
+    </section>
+  </div>
+</main>
+
+<script src="https://cjrtnc.leaningtech.com/4.2/loader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
+<script>
+const SAMPLE = `public class Main {
+    public static void main(String[] args) {
+        int sum = 0;
+        for (int i = 1; i <= 10; i++) {
+            sum += i;
+        }
+        System.out.println("Hello, Java!");
+        System.out.println("1から10の合計: " + sum);
+    }
+}
+`;
+const KEY = "java-editor:code";
+const $ = id => document.getElementById(id);
+const statusEl = $("status"), runBtn = $("run"), consoleEl = $("console");
+let editor, cheerpReady = false, running = false;
+// CheerpJ の /app/ はサイトのルート。サブフォルダ公開（user.github.io/repo/）でも動くようパスを補う
+const APP = "/app" + location.pathname.replace(/[^/]*$/, "");
+
+function setStatus(t) { statusEl.textContent = t; }
+function load() { try { return localStorage.getItem(KEY) || SAMPLE; } catch { return SAMPLE; } }
+function save(v) { try { localStorage.setItem(KEY, v); } catch {} }
+
+// ---- Monaco ----
+const MONACO_BASE = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min";
+require.config({ paths: { vs: MONACO_BASE + "/vs" } });
+self.MonacoEnvironment = {
+  getWorkerUrl: () => URL.createObjectURL(new Blob(
+    [`self.MonacoEnvironment={baseUrl:'${MONACO_BASE}/'};importScripts('${MONACO_BASE}/vs/base/worker/workerMain.js');`],
+    { type: "text/javascript" }))
+};
+require(["vs/editor/editor.main"], () => {
+  editor = monaco.editor.create($("editor"), {
+    value: load(), language: "java", theme: "vs-dark", automaticLayout: true,
+    fontSize: 14, minimap: { enabled: false }, tabSize: 4, scrollBeyondLastLine: false
+  });
+  editor.onDidChangeModelContent(() => save(editor.getValue()));
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, run);
+  initJava();
+});
+
+// ---- CheerpJ ----
+async function initJava() {
+  if (location.protocol === "file:") {
+    setStatus("サーバー経由で開いてください");
+    consoleEl.textContent = "CheerpJ は file:// では動きません。同梱の serve.mjs を使い、http://localhost:8080/ で開いてください。";
+    return;
+  }
+  try {
+    const r = await fetch("tools.jar", { method: "HEAD" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+  } catch (e) {
+    setStatus("tools.jar が見つかりません");
+    consoleEl.textContent = "このHTMLと同じフォルダに tools.jar（OpenJDK 8 の javac）を置いてください。";
+    return;
+  }
+  setStatus("Java を準備中…（初回は時間がかかります）");
+  try {
+    await cheerpjInit({ version: 8 });
+    cheerpReady = true;
+    runBtn.disabled = false;
+    setStatus("準備完了");
+  } catch (e) {
+    setStatus("Java の初期化に失敗しました");
+    consoleEl.innerHTML = '<span class="msg-err">CheerpJ を読み込めませんでした。ネットワーク接続と、loader.js のバージョンを確認してください。\n' + String(e) + "</span>";
+  }
+}
+
+async function run() {
+  if (!cheerpReady || running || !editor) return;
+  running = true; runBtn.disabled = true;
+  consoleEl.textContent = "";
+  const src = editor.getValue();
+  const m = src.match(/public\s+(?:final\s+)?class\s+([A-Za-z_$][\w$]*)/)
+         || src.match(/class\s+([A-Za-z_$][\w$]*)(?=[^{]*\{[\s\S]*?static\s+void\s+main)/);
+  const cls = m ? m[1] : "Main";
+  try {
+    setStatus("コンパイル中…");
+    let b64 = "";
+    for (const b of new TextEncoder().encode($("stdin").value)) b64 += String.fromCharCode(b);
+    b64 = btoa(b64);
+    const launcher = `public class IdeLauncher__ {
+  public static void main(String[] a) throws Throwable {
+    System.setIn(new java.io.ByteArrayInputStream(java.util.Base64.getDecoder().decode("${b64}")));
+    ${cls}.main(a);
+  }
+}`;
+    cheerpOSAddStringFile("/str/" + cls + ".java", src);
+    cheerpOSAddStringFile("/str/IdeLauncher__.java", launcher);
+    const rc = await cheerpjRunMain("com.sun.tools.javac.Main", APP + "tools.jar",
+      "/str/" + cls + ".java", "/str/IdeLauncher__.java", "-d", "/files/");
+    if (rc !== 0) { setStatus("コンパイルエラー"); return; }
+    setStatus("実行中…");
+    await cheerpjRunMain("IdeLauncher__", "/files/");
+    setStatus("完了");
+  } catch (e) {
+    setStatus("実行エラー");
+    consoleEl.insertAdjacentHTML("beforeend", '<span class="msg-err">\n' + String(e).replace(/</g, "&lt;") + "</span>");
+  } finally {
+    running = false; runBtn.disabled = false;
+  }
+}
+
+runBtn.addEventListener("click", run);
+$("reset").addEventListener("click", () => {
+  if (editor && confirm("エディターの内容をサンプルに戻します。よろしいですか？")) editor.setValue(SAMPLE);
+});
+</script>
+</body>
+</html>
