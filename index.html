@@ -15,6 +15,7 @@
   #status { color:var(--dim); font-size:13px; }
   button { font:inherit; color:#1b1d23; background:var(--accent); border:0; border-radius:4px; padding:6px 16px; font-weight:600; cursor:pointer; }
   button.sub { background:transparent; color:var(--fg); border:1px solid var(--line); font-weight:400; }
+  select { font:inherit; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:4px; padding:5px 8px; }
   button:disabled { opacity:.45; cursor:not-allowed; }
   button:focus-visible { outline:2px solid #fff; outline-offset:2px; }
   main { flex:1; display:flex; flex-direction:column; min-height:0; }
@@ -39,7 +40,7 @@
   <span id="status">エディターを読み込み中…</span>
   <button class="sub" id="open" type="button">開く</button>
   <button class="sub" id="save" type="button">保存 (Ctrl+S)</button>
-  <button class="sub" id="reset" type="button">サンプルに戻す</button>
+  <select id="samples" aria-label="サンプルを選ぶ"><option value="">サンプルを選ぶ…</option></select>
   <input type="file" id="file" accept=".java,.txt" hidden>
   <button id="run" type="button" disabled>実行 (Ctrl+Enter)</button>
 </header>
@@ -71,6 +72,75 @@ const SAMPLE = `public class Main {
     }
 }
 `;
+const SAMPLES = [
+  { name: "基本：合計", code: SAMPLE },
+  { name: "繰り返し：FizzBuzz", code: `public class Main {
+    public static void main(String[] args) {
+        for (int i = 1; i <= 15; i++) {
+            if (i % 15 == 0) {
+                System.out.println("FizzBuzz");
+            } else if (i % 3 == 0) {
+                System.out.println("Fizz");
+            } else if (i % 5 == 0) {
+                System.out.println("Buzz");
+            } else {
+                System.out.println(i);
+            }
+        }
+    }
+}
+` },
+  { name: "入力：Scanner", input: "10\n20\n", code: `import java.util.Scanner;
+
+public class Main {
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        int a = sc.nextInt();
+        int b = sc.nextInt();
+        System.out.println(a + " + " + b + " = " + (a + b));
+    }
+}
+` },
+  { name: "配列：平均と最高点", code: `public class Main {
+    public static void main(String[] args) {
+        int[] scores = {72, 85, 90, 64, 78};
+        int sum = 0;
+        int max = scores[0];
+        for (int s : scores) {
+            sum += s;
+            if (s > max) {
+                max = s;
+            }
+        }
+        System.out.println("合計: " + sum);
+        System.out.println("平均: " + (double) sum / scores.length);
+        System.out.println("最高点: " + max);
+    }
+}
+` },
+  { name: "クラス：オブジェクト", code: `public class Main {
+    static class Counter {
+        private int count = 0;
+
+        void increment() {
+            count++;
+        }
+
+        int getCount() {
+            return count;
+        }
+    }
+
+    public static void main(String[] args) {
+        Counter c = new Counter();
+        for (int i = 0; i < 5; i++) {
+            c.increment();
+        }
+        System.out.println("カウント: " + c.getCount());
+    }
+}
+` }
+];
 const KEY = "java-editor:code";
 const $ = id => document.getElementById(id);
 const statusEl = $("status"), runBtn = $("run"), consoleEl = $("console");
@@ -97,6 +167,56 @@ function detectClass(src) {
          || src.match(/class\s+([A-Za-z_$][\w$]*)(?=[^{]*\{[\s\S]*?static\s+void\s+main)/);
   return m ? m[1] : "Main";
 }
+// ---- リアルタイム構文チェック（javac の診断を波線で表示）----
+let checkTimer, checking = false, checkOff = false;
+function scheduleCheck() { clearTimeout(checkTimer); checkTimer = setTimeout(check, 1200); }
+
+function parseDiag(text) {
+  const L = text.split(/\r?\n/), out = [];
+  for (let i = 0; i < L.length; i++) {
+    const m = L[i].match(/^(.+?\.java):(\d+): (error|warning): (.*)$/);
+    if (!m) continue;
+    let msg = m[4], col = 1, j = i + 1;
+    if (j + 1 < L.length && /^\s*\^/.test(L[j + 1])) { col = L[j + 1].indexOf("^") + 1; j += 2; }
+    while (j < L.length && !/\.java:\d+: /.test(L[j]) && !/^\d+ errors?$/.test(L[j])) {
+      if (L[j].trim()) msg += "\n" + L[j].trim();
+      j++;
+    }
+    if (m[3] === "error") out.push({ file: m[1], line: +m[2], col, msg, raw: L.slice(i, j).join("\n").trimEnd() });
+    i = j - 1;
+  }
+  return out;
+}
+// 上の行から順に並べる（内部の起動用クラス由来のエラーは最後）
+const byPos = (a, b) => (a.file.includes("IdeLauncher__") - b.file.includes("IdeLauncher__")) || a.line - b.line || a.col - b.col;
+const JAVAC_OPTS = ["-Xstdout", "/files/diag.txt"];
+function toMarkers(model, diags) {
+  return diags.filter(d => d.line <= model.getLineCount()).map(d => {
+    const max = model.getLineMaxColumn(d.line);
+    const w = model.getWordAtPosition({ lineNumber: d.line, column: d.col });
+    let start = d.col, end = (w && w.startColumn === d.col) ? w.endColumn : d.col + 1;
+    if (start >= max) { start = Math.max(1, max - 1); end = max; }
+    return { severity: monaco.MarkerSeverity.Error, message: d.msg,
+             startLineNumber: d.line, startColumn: start, endLineNumber: d.line, endColumn: Math.min(end, max) };
+  });
+}
+async function check() {
+  if (!cheerpReady || running || checking || checkOff || !editor) return;
+  checking = true;
+  const model = editor.getModel(), ver = model.getVersionId(), src = model.getValue();
+  try {
+    const cls = detectClass(src);
+    cheerpOSAddStringFile("/str/" + cls + ".java", src);
+    await cheerpjRunMain("com.sun.tools.javac.Main", APP + "tools.jar",
+      ...JAVAC_OPTS, "-proc:none", "/str/" + cls + ".java", "-d", "/files/");
+    const text = await (await cjFileBlob("/files/diag.txt")).text();
+    if (model.getVersionId() === ver) monaco.editor.setModelMarkers(model, "javac", toMarkers(model, parseDiag(text).sort(byPos)));
+  } catch (e) {
+    checkOff = true; consoleEl.textContent = "";
+    setStatus("リアルタイム構文チェックは使えません（実行は可能です）");
+  } finally { checking = false; }
+}
+
 function download() {
   const src = editor.getValue(), name = detectClass(src) + ".java";
   const url = URL.createObjectURL(new Blob([src], { type: "text/plain;charset=utf-8" }));
@@ -119,7 +239,7 @@ require(["vs/editor/editor.main"], () => {
     value: load(), language: "java", theme: "vs-dark", automaticLayout: true,
     fontSize: 14, minimap: { enabled: false }, tabSize: 4, scrollBeyondLastLine: false
   });
-  editor.onDidChangeModelContent(() => { save(editor.getValue()); updateStdin(); });
+  editor.onDidChangeModelContent(() => { save(editor.getValue()); updateStdin(); scheduleCheck(); });
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, download);
   updateStdin();
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, run);
@@ -147,6 +267,7 @@ async function initJava() {
     cheerpReady = true;
     runBtn.disabled = false;
     setStatus("準備完了");
+    scheduleCheck();
   } catch (e) {
     setStatus("Java の初期化に失敗しました");
     consoleEl.innerHTML = '<span class="msg-err">CheerpJ を読み込めませんでした。ネットワーク接続と、loader.js のバージョンを確認してください。\n' + String(e) + "</span>";
@@ -157,6 +278,7 @@ async function run() {
   if (!cheerpReady || running || !editor) return;
   running = true; runBtn.disabled = true;
   consoleEl.textContent = "";
+  while (checking) await new Promise(r => setTimeout(r, 100));
   const src = editor.getValue();
   const cls = detectClass(src);
   try {
@@ -196,8 +318,16 @@ $("file").addEventListener("change", async e => {
   editor.executeEdits("open", [{ range: editor.getModel().getFullModelRange(), text }]);
   setStatus(f.name + " を開きました");
 });
-$("reset").addEventListener("click", () => {
-  if (editor && confirm("エディターの内容をサンプルに戻します。よろしいですか？")) editor.setValue(SAMPLE);
+const sel = $("samples");
+SAMPLES.forEach((x, i) => sel.add(new Option(x.name, i)));
+sel.addEventListener("change", () => {
+  const x = SAMPLES[sel.value]; sel.value = "";
+  if (!x || !editor) return;
+  if (!confirm("エディターの内容を「" + x.name + "」のサンプルに置き換えます。よろしいですか？")) return;
+  editor.setValue(x.code);
+  $("stdin").value = x.input || "";
+  consoleEl.textContent = "";
+  setStatus("サンプルを読み込みました");
 });
 </script>
 </body>
